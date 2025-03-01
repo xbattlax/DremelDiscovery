@@ -1,8 +1,11 @@
 import os
 import json
-import requests
+import threading
+import time
+import urllib.request
+import urllib.error
+import socket
 from threading import Thread
-from time import sleep
 
 from UM.i18n import i18nCatalog
 from UM.Logger import Logger
@@ -74,7 +77,9 @@ class DremelOutputDevice(OutputDevice):
         gcode_writer.requestWrite(nodes, temp_file, limit_mimetypes, file_handler, **kwargs)
 
         # Upload the G-code to the printer
-        self._uploadGCode(temp_file, file_name)
+        thread = threading.Thread(target=self._uploadGCode, args=(temp_file, file_name))
+        thread.daemon = True
+        thread.start()
 
     def _uploadGCode(self, temp_file, file_name):
         """Upload G-code to the Dremel printer."""
@@ -87,29 +92,57 @@ class DremelOutputDevice(OutputDevice):
             message = Message(catalog.i18nc("@info:status", "Uploading to Dremel printer"), 0, progress=0)
             message.show()
 
-            # Upload the file
-            command_url = f"{self._url}command"
-            response = requests.post(
-                command_url,
-                files={"file": (file_name, gcode_data)},
-                data={"command": "upload"},
-                timeout=10
-            )
+            # Upload the file using multipart form
+            boundary = '----WebKitFormBoundary7MA4YWxkTrZu0gW'
 
-            if response.status_code == 200:
+            # Create the multipart form data for the file upload
+            content_type = 'multipart/form-data; boundary=%s' % boundary
+
+            # Form data preparation
+            form_data = []
+            form_data.append('--%s' % boundary)
+            form_data.append('Content-Disposition: form-data; name="command"')
+            form_data.append('')
+            form_data.append('upload')
+            form_data.append('--%s' % boundary)
+            form_data.append('Content-Disposition: form-data; name="file"; filename="%s"' % file_name)
+            form_data.append('Content-Type: application/octet-stream')
+            form_data.append('')
+
+            # Join everything except the file content
+            form_data_str = '\r\n'.join(form_data)
+            form_data_bytes = form_data_str.encode('utf-8')
+
+            # Add the file content and the end boundary
+            end_boundary = '\r\n--%s--\r\n' % boundary
+            end_boundary_bytes = end_boundary.encode('utf-8')
+
+            # Total content to send
+            data = form_data_bytes + b'\r\n' + gcode_data + b'\r\n' + end_boundary_bytes
+
+            # Create the request
+            command_url = f"{self._url}command"
+            req = urllib.request.Request(command_url, data=data)
+            req.add_header('Content-Type', content_type)
+            req.add_header('Content-Length', len(data))
+
+            # Send the request
+            response = urllib.request.urlopen(req, timeout=30)
+
+            # Check the response
+            if response.status == 200:
                 message.hide()
                 success_message = Message(
                     catalog.i18nc("@info:status", "Print job uploaded to Dremel printer successfully."))
                 success_message.show()
 
                 # Start the print job
-                start_response = requests.post(
-                    command_url,
-                    data={"command": "printfile", "filename": file_name},
-                    timeout=10
-                )
+                req = urllib.request.Request(command_url)
+                req.add_header('Content-Type', 'application/x-www-form-urlencoded')
+                start_data = f"command=printfile&filename={file_name}".encode('utf-8')
+                start_response = urllib.request.urlopen(req, data=start_data, timeout=10)
 
-                if start_response.status_code == 200:
+                if start_response.status == 200:
                     self._printing = True
                     self._progress = 0
                     self.progressChanged.emit()
@@ -139,22 +172,24 @@ class DremelOutputDevice(OutputDevice):
         """Thread function to monitor printer status."""
         while True:
             try:
-                # Try to connect to the printer
-                response = requests.post(
-                    f"{self._url}command",
-                    data="getprinterstatus",
-                    headers={"Content-Type": "text/plain"},
-                    timeout=5
-                )
+                # Set a reasonable timeout
+                socket.setdefaulttimeout(5)
 
-                if response.status_code == 200:
+                # Try to connect to the printer
+                req = urllib.request.Request(f"{self._url}command")
+                req.add_header('Content-Type', 'text/plain')
+
+                response = urllib.request.urlopen(req, data=b'getprinterstatus')
+
+                # Check if connected successfully
+                if response.status == 200:
                     # Connected successfully
                     if not self._is_connected:
                         self._is_connected = True
                         self.stateChanged.emit()
 
                     # Parse printer status
-                    status_data = response.json()
+                    status_data = json.loads(response.read().decode('utf-8'))
 
                     # Update printing status
                     printing_status = status_data.get("build", {}).get("status", "").lower()
@@ -181,7 +216,7 @@ class DremelOutputDevice(OutputDevice):
                 Logger.log("d", f"Error connecting to Dremel printer: {str(e)}")
 
             # Wait before checking again
-            sleep(2)
+            time.sleep(2)
 
     def _automaticFileName(self, nodes):
         """Generate an automatic file name based on the model name."""

@@ -1,7 +1,10 @@
 import os
 import json
-import asyncio
-import aiohttp
+import threading
+import time
+import urllib.request
+import urllib.error
+import socket
 from typing import Dict, List, Optional
 
 from UM.i18n import i18nCatalog
@@ -19,7 +22,7 @@ catalog = i18nCatalog("uranium")
 
 @signalemitter
 class DremelDiscoveryPlugin(OutputDevicePlugin):
-    """Plugin for discovering Dremel 3D printers on the local network."""
+    """Plugin for discovering Dremel 3D printers on the local network using standard libraries."""
 
     discoveredDevicesChanged = Signal()
 
@@ -27,7 +30,6 @@ class DremelDiscoveryPlugin(OutputDevicePlugin):
         super().__init__()
         self._discovered_devices = {}
         self._discovery_thread = None
-        self._last_search_time = None
         self._is_scanning = False
 
         # Create settings
@@ -56,8 +58,9 @@ class DremelDiscoveryPlugin(OutputDevicePlugin):
         # Start the discovery in a separate thread, to not block the interface
         if self._discovery_thread is None:
             Logger.log("i", "Starting Dremel printer discovery")
-            self._discovery_thread = asyncio.get_event_loop_policy().new_event_loop()
-            asyncio.run_coroutine_threadsafe(self._discoverDremelPrinters(), self._discovery_thread)
+            self._discovery_thread = threading.Thread(target=self._discoverDremelPrinters)
+            self._discovery_thread.daemon = True
+            self._discovery_thread.start()
 
     def stopDiscovery(self):
         """Stop the discovery process."""
@@ -65,49 +68,66 @@ class DremelDiscoveryPlugin(OutputDevicePlugin):
             return
 
         self._is_scanning = False
-        if self._discovery_thread is not None:
-            self._discovery_thread.close()
-            self._discovery_thread = None
+        self._discovery_thread = None
 
-    async def _fetch(self, session, url, ip):
-        """Fetch data from a Dremel printer."""
+    def _checkPrinter(self, ip):
+        """Check if the given IP has a Dremel printer."""
+        url = f"http://{ip}:80/command"
+        printer_found = False
+
         try:
-            async with session.post(url, data='getprinterstatus') as response:
-                json_response = await response.json(content_type=None)
+            # Set a short timeout to avoid hanging
+            socket.setdefaulttimeout(1)
 
-                # If we get a valid response, it's likely a Dremel printer
-                if json_response:
-                    printer_url = f"http://{ip}/"
+            # Prepare the request with text/plain content type
+            req = urllib.request.Request(url)
+            req.add_header('Content-Type', 'text/plain')
 
-                    # Get printer name and other info if available
-                    printer_name = json_response.get("machine", {}).get("name", f"Dremel {ip}")
+            # Send the getprinterstatus command
+            response = urllib.request.urlopen(req, data=b'getprinterstatus')
 
-                    self._onDeviceFound(ip, printer_name, printer_url, json_response)
+            # Read and parse the JSON response
+            json_response = json.loads(response.read().decode('utf-8'))
 
-                    Logger.log("i", f"Found Dremel printer at {printer_url}")
-                    return True
-        except asyncio.TimeoutError:
+            # If we get a valid response, it's likely a Dremel printer
+            if json_response:
+                printer_url = f"http://{ip}/"
+
+                # Get printer name and other info if available
+                printer_name = json_response.get("machine", {}).get("name", f"Dremel {ip}")
+
+                self._onDeviceFound(ip, printer_name, printer_url, json_response)
+                Logger.log("i", f"Found Dremel printer at {printer_url}")
+                printer_found = True
+
+        except urllib.error.URLError:
+            # This is normal for most IPs that don't have a Dremel printer
             pass
-        except aiohttp.ClientError:
+        except socket.timeout:
+            # This is also normal for most IPs
             pass
         except Exception as e:
-            Logger.log("d", f"Error while fetching data from {url}: {str(e)}")
+            # Something else went wrong
+            Logger.log("d", f"Error while checking {url}: {str(e)}")
 
-        return False
+        return printer_found
 
-    async def _discoverDremelPrinters(self):
+    def _discoverDremelPrinters(self):
         """Discover Dremel printers on the network."""
         Logger.log("i", "Starting Dremel printer discovery process")
 
+        devices_found = 0
+
         # Using the same IP range as your original code (2-250)
-        base_url = "http://192.168.1.{}:80/command"
+        for i in range(2, 250):
+            if not self._is_scanning:
+                break
 
-        timeout = aiohttp.ClientTimeout(total=1)
-        async with aiohttp.ClientSession(timeout=timeout, headers={'Content-Type': 'text/plain'}) as session:
-            tasks = [self._fetch(session, base_url.format(i), f"192.168.1.{i}") for i in range(2, 250)]
-            results = await asyncio.gather(*tasks)
+            ip = f"192.168.1.{i}"
+            if self._checkPrinter(ip):
+                devices_found += 1
 
-        Logger.log("i", f"Dremel printer discovery complete. Found {sum(1 for r in results if r)} devices")
+        Logger.log("i", f"Dremel printer discovery complete. Found {devices_found} devices")
         self._is_scanning = False
 
     def _onDeviceFound(self, ip, name, url, properties=None):

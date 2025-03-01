@@ -1,0 +1,8 @@
+{
+    "name": "Dremel Printer Connection",
+    "author": "Your Name",
+    "version": "1.0.0",
+    "description": "Allows you to connect to Dremel 3D printers on your local network",
+    "api": 5,
+    "supported_sdk_versions": ["7.0.0", "8.0.0"]
+}
